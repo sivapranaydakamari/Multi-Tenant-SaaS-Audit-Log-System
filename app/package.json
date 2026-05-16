@@ -1,0 +1,18 @@
+{
+  "name": "multi-tenant-audit-app",
+  "version": "1.0.0",
+  "description": "HTTP gateway and archival worker for the multi-tenant Kafka audit log system",
+  "main": "gateway.js",
+  "scripts": {
+    "start": "node gateway.js",
+    "archiver": "node archiver.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "kafkajs": "^2.2.4",
+    "minio": "^7.1.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
