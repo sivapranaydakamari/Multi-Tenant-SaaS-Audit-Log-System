@@ -1,0 +1,191 @@
+version: "3.8"
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      # Enable ruok and srvr four-letter commands (disabled by default in newer ZK)
+      ZOOKEEPER_4LW_COMMANDS_WHITELIST: "ruok,srvr,stat,mntr"
+    ports:
+      - "2181:2181"
+    healthcheck:
+      # Use bash built-in TCP to check port reachability — no nc required.
+      # Then confirm ZK is serving by sending 'ruok' (now whitelisted above).
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181 2>/dev/null | grep -q imok || cat < /dev/null > /dev/tcp/localhost/2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks:
+      - audit-net
+
+  # Short-lived init container: creates the kafka-broker and admin SCRAM users
+  # directly in ZooKeeper BEFORE the Kafka broker starts.
+  # We override the cp-kafka entrypoint so our script runs instead of the broker.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-init
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      ADMIN_PASSWORD: ${KAFKA_ADMIN_PASSWORD:-admin-secret}
+    entrypoint: ["/bin/bash", "/tmp/kafka-init.sh"]
+    volumes:
+      - ./config/kafka-init.sh:/tmp/kafka-init.sh:ro
+    networks:
+      - audit-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "9092:9092"  # EXTERNAL — SASL_PLAINTEXT for host-side scripts
+      - "9093:9093"  # INTERNAL — SASL_PLAINTEXT for Docker app containers
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # Two listeners — both SASL_PLAINTEXT:
+      #   INTERNAL — for Docker-network clients (app, archiver, admin CLI inside container)
+      #   EXTERNAL — for host-side scripts (provision.sh, test scripts via docker exec)
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9093,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      KAFKA_SASL_ENABLED_MECHANISMS: SCRAM-SHA-256
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: SCRAM-SHA-256
+
+      # We bypass Confluent's preflight (cub ClusterStatus) with a custom entrypoint,
+      # so setting java.security.auth.login.config here is safe — the broker JVM picks
+      # it up, but the preflight tool never runs to misuse it.
+      # -Dzookeeper.sasl.client=false prevents the broker's ZK client from attempting
+      # SASL auth (ZooKeeper runs without auth in this setup).
+      KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/kafka_jaas.conf -Dzookeeper.sasl.client=false"
+
+      # ACLs: every action must have an explicit Allow; deny everything else
+      KAFKA_AUTHORIZER_CLASS_NAME: kafka.security.authorizer.AclAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+      KAFKA_SUPER_USERS: "User:admin;User:kafka-broker"
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: 60000
+      KAFKA_ZOOKEEPER_CONNECTION_TIMEOUT_MS: 60000
+    volumes:
+      - ./config/kafka_jaas.conf:/etc/kafka/kafka_jaas.conf:ro
+    # Custom entrypoint: run Confluent's configure step (env vars → server.properties),
+    # then start Kafka directly — skipping the 'cub ClusterStatus' preflight that would
+    # hang trying to SASL-authenticate with ZooKeeper.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /etc/confluent/docker/configure
+        echo "[kafka] Waiting for ZooKeeper at zookeeper:2181 ..."
+        until cat < /dev/null > /dev/tcp/zookeeper/2181 2>/dev/null; do
+          echo "[kafka] ZK not ready, retrying in 2s..."
+          sleep 2
+        done
+        echo "[kafka] ZooKeeper ready. Starting broker..."
+        exec kafka-server-start /etc/kafka/kafka.properties
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9093"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 45s
+    networks:
+      - audit-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - audit-net
+
+  # Creates the MinIO bucket on startup, then exits
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-minioadmin} &&
+        mc mb --ignore-existing local/kafka-archive &&
+        echo 'MinIO bucket kafka-archive ready.'
+      "
+    networks:
+      - audit-net
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: audit-app
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9093}
+      KAFKA_ADMIN_USER: ${KAFKA_ADMIN_USER:-admin}
+      KAFKA_ADMIN_PASSWORD: ${KAFKA_ADMIN_PASSWORD:-admin-secret}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio}
+      MINIO_PORT: ${MINIO_PORT:-9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-kafka-archive}
+      APP_PORT: ${APP_PORT:-3000}
+      ARCHIVE_INTERVAL_SECONDS: ${ARCHIVE_INTERVAL_SECONDS:-300}
+      TENANT_ACME_PASSWORD: ${TENANT_ACME_PASSWORD:-acme-secret}
+      TENANT_GLOBEX_PASSWORD: ${TENANT_GLOBEX_PASSWORD:-globex-secret}
+      TENANT_INITECH_PASSWORD: ${TENANT_INITECH_PASSWORD:-initech-secret}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - audit-net
+
+volumes:
+  minio-data:
+
+networks:
+  audit-net:
+    driver: bridge
