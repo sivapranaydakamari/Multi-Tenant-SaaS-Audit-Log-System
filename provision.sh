@@ -27,7 +27,6 @@ declare -A TENANT_PASSWORDS=(
 # Quota: 1 MB/s = 1048576 bytes/s
 QUOTA_BYTES=1048576
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 # Run a kafka CLI command inside the kafka container as the admin user.
 kafka_exec() {
@@ -58,13 +57,11 @@ echo "========================================================"
 echo "  Multi-Tenant Audit System — Provisioning Script"
 echo "========================================================"
 
-# ─── Step 1: Write admin client properties (admin user already created by kafka-init) ──
 echo ""
 echo "[1/5] Writing admin client properties..."
 setup_admin_props
 echo "      Admin properties written to /tmp/admin.properties inside container."
 
-# ─── Step 2: Create audit.violations topic ────────────────────────────────────
 echo ""
 echo "[2/5] Creating audit.violations topic..."
 kafka_exec "kafka-topics \
@@ -76,7 +73,6 @@ kafka_exec "kafka-topics \
   --replication-factor 1 \
   --if-not-exists" && echo "      audit.violations created."
 
-# ─── Step 3: Per-tenant provisioning ─────────────────────────────────────────
 echo ""
 echo "[3/5] Provisioning tenants..."
 
@@ -165,8 +161,6 @@ for tenant in "${TENANTS[@]}"; do
   echo "      Tenant '${tenant}' provisioned successfully."
 done
 
-# ─── Step 4: Verification ─────────────────────────────────────────────────────
-echo ""
 echo "[4/5] Verifying provisioned resources..."
 
 echo ""
@@ -195,7 +189,6 @@ for tenant in "${TENANTS[@]}"; do
     --entity-name ${tenant}" | grep -E "producer_byte_rate|consumer_byte_rate" | sed 's/^/      /'
 done
 
-# ─── Step 5: Copy admin properties for the healthcheck inside the container ───
 echo ""
 echo "[5/5] Installing admin properties for Kafka healthcheck..."
 kafka_exec "cp /tmp/admin.properties /tmp/admin.properties" 2>/dev/null || true
